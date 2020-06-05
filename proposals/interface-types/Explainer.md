@@ -1,93 +1,85 @@
 # Interface Types Proposal
 
 The proposal adds a new set of **interface types** to WebAssembly that describe
-high-level values (like strings, sequences, records and variants) without
-committing to a single memory representation or sharing scheme. Interface types
-can only be used in the interfaces of modules and can only be produced or
-consumed by declarative **interface adapters**.
+high-level values (like strings, arrays, records and variants) along with a new
+set of instructions that produce and consume interface types which are designed
+to be highly optimizable. The proposal is semantically layered on top of the
+WebAssembly [core spec] and thus can be implemented in terms of an unmodified
+core WebAssembly implementation. This new layer wraps WebAssembly's *core
+modules* with a new *kind* of WebAssembly module called a **component**.
+Components provide the WebAssembly ecosystem a highly embeddable, composable,
+virtualizable and language-neutral unit of code reuse and distribution.
 
-The proposal is semantically layered on top of the WebAssembly [core spec]
-(extended with the [multi-value] and [reference types] proposals), and
-adds only the ability to adapt the imports and exports of a WebAssembly
-module at points which are already host-defined behavior. All adaptations are
-specified in a [custom section] and this feature can be polyfilled using the
-[JS API].
+1. [Problem](#problem)
+2. [Use Cases](#use-cases)
+3. [Additional Requirements](#additional-requirements)
+4. [Proposal](#proposal)
+   1. [Interface Types](#interface-types)
+   2. [Lifting and Lowering Instructions](#lifting-and-lowering-instructions)
+   3. [Adapter Functions](#adapter-functions)
+   4. [Components](#components)
+   5. [Lazy Lifting: Avoiding Intermediate Copies by Design](#lazy-lifting-avoiding-intermediate-copies-by-design)
+   6. [Ownership Instructions: Reliably Releasing Resources In the Presence of Laziness](#ownership-instructions-reliably-releasing-resources-in-the-presence-of-laziness)
+   7. [Exception and Trap Safety](#exception-and-trap-safety)
+5. [Use Cases Revisited](#use-cases-revisited)
+6. [Additional Requirements Revisited](#additional-requirements-revisited)
+7. [FAQ](#FAQ)
+8. [TODO](#TODO)
 
-1. [Motivation](#motivation)
-1. [Overview](#overview)
-1. [Walkthrough](#walkthrough)
-1. [Web IDL integration](#web-idl-integration)
-1. [FAQ](#FAQ)
+
+## Problem
+
+As a compiler target, WebAssembly provides only low-level types that aim to be
+as close to the underlying machine as possible allowing each source language to
+implement its own high-level types efficiently on top of the low-level types.
+However, when modules from multiple languages need to communicate with each
+other or the host, this raises the question of how to exchange high-level
+values at the interface.
+ 
+The current best approach for dealing with this problem is to generate
+JavaScript *glue code* that uses the powerful [JS API] to convert between
+values at interface boundaries. However, the JavaScript glue code approach has
+several limitations:
+* It depends on the host including a JavaScript implementation, which not all
+  hosts do or can.
+* JavaScript glue code incurs unnecessary overhead due to copying, transition
+  costs and loss of static type information.
+
+Ideally, a solution to this problem would only depends on language-independent
+WebAssembly standards or conventions.
 
 
-## Motivation
+## Use Cases
 
-This proposal is motivated by 3 distinct problems:
+To help motivate the proposed solution, we consider 3 use cases. After the
+proposal is introduced, the use cases are [revisited below](#use-cases-revisited).
+
 
 ### Optimizing calls to Web APIs
 
-With the [reference types] proposal, WebAssembly code can pass around arbitrary
-JavaScript values using the [`anyref`] type. By default, JavaScript
-values flowing into WebAssembly get boxed into `anyref` values which are then
-unboxed whenever flowing back out to JavaScript. These boxed values are
-opaque to WebAssembly, but, by importing JavaScript builtin functions like
-[`Reflect.construct`], [`Reflect.apply`], [`Reflect.set`] and [`Reflect.get`],
-WebAssembly modules are able to perform many fundamental JavaScript operations
-without requiring JavaScript glue code, ultimately allowing WebAssembly to call
-any method defined in Web IDL by synthesizing appropriate JavaScript values.
+A long-standing source of friction between WebAssembly and the rest of the
+Web platform (and the original motivating use case for this proposal) is that
+calling Web APIs from WebAssembly usually requires thunking through JavaScript
+which hurts performance and adds extra complexity for developers to think
+about. Technically, since they are exported as JavaScript functions, Web
+IDL-defined functions can be directly imported and called by WebAssembly
+through the [JS API]. However, Web IDL functions usually take and produce
+high-level Web IDL types like [`DOMString`] and [Sequence] while WebAssembly
+can only pass numbers.
 
-However, just removing JS glue code between WebAssembly and Web IDL doesn't
-remove all the unnecessary call overhead. For one thing, all the auxiliary
-calls to `Reflect` builtins may end up running slower than the highly
-JIT-optimized JS glue code. For another, glue code or not, synthesizing
-JavaScript values often requires copying WebAssembly values and linear memory
-into GC-allocated JS strings and objects that immediately become garbage after
-the call. Lastly, calling a statically-typed Web IDL-defined method with
-dynamically-typed JavaScript values can add additional runtime overhead.
+With Interface Types, ideally WebAssembly could create Web IDL-compatible
+high-level types and pass them directly to statically-typed browser entry
+points without transit through JS.
 
-With the addition of interface types, the Web IDL spec could add a
-"WebAssembly binding" section (symmetric to the current [ECMAScript binding]
-section) which defines how WebAssembly values (including values of interface
-types) can be converted to and from Web IDL values, without going through
-JavaScript, even for high-level types like `DOMString` and [Dictionary]. An
-optimizing engine can then compile the declarative, statically-typed interface
-adapters into efficient stubs that call more-directly into the API's
-implementation.
-
-### Enabling "shared-nothing linking" of WebAssembly modules
-
-While WebAssembly intentionally supports [dynamic linking], in which multiple
-instances share the same memory and table, emulating [native dynamic linking],
-this type of linking is more fragile:
-* Modules must carefully coordinate (at the toolchain and source level) to
-  share data and avoid generally clobbering each other.
-* Corruption in one module can affect other modules, with certain bugs
-  only manifesting with certain combinations of modules.
-* Modules are less able to encapsulate, leading to unwanted representation
-  dependencies or violations of the Principle of Least Authority.
-
-In contrast, "shared-nothing linking" refers to a linking scheme in which
-each module defines and encapsulates its own memory and table. However, there is
-currently no host-independent way to implement even basic shared-nothing linking
-operations like copying an array of bytes from one module's linear memory to
-another.
-
-With interface types available to use at the boundary between two
-modules, exports and imports can take, e.g., an abstract sequence of bytes,
-or a string, or a sequence of pairs of strings and integers, etc. With interface
-adapters to define how these abstract values are to be read from or written into
-linear memory, modules can use the wasm engine to take care of copying data
-between two modules' linear memories while allowing both modules to
-maintain full encapsulation.
 
 ### Defining language-neutral interfaces like WASI
 
 While many [WASI] signatures can be expressed in terms of `i32`s and,
-in the future, references to [type imports], there is still a need for WASI
-functions to take and return higher-level value types like strings or sequences.
-Currently, these values are specified in terms of linear memory. For example,
-in [`path_open`], a string is passed as a pair of `i32`s which represent the
-offset and length, respectively, of the string in linear memory.
+in the future, references to [type imports][Type Import], there is still a need
+for WASI functions to take and return higher-level value types like strings or
+arrays. Currently, these values are specified in terms of linear memory. For
+example, in [`path_open`], a string is passed as a pair of `i32`s which
+represent the offset and length, respectively, of the string in linear memory.
 
 However, specifying this single, fixed representation for data types like
 strings will become problematic if:
@@ -98,558 +90,706 @@ strings will become problematic if:
   without copy; or
 * the need arises to allow more than just UTF-8 encoding.
 
-With interface types, WASI functions can simply use the interface type `string`,
-allowing abstract string values to be created from linear memory, GC memory and
-host-string values, with the source and encoding specified explicitly by the
-calling module and extensible over time.
+Ideally, WASI APIs would be able to use simple high-level types that could be
+constructed from a variety of source representations.
+
+There's also another, more subtle problem with passing `i32`s: they implicitly
+refer to the caller's memory. Currently, this requires that all WASI client
+modules must export their memory with a designated name (`"memory"`) and it
+also requires special tricks for WASI implementations to be able to find
+this memory. Ideally, WASI APIs would simply take values without the client
+or the implementation needing to expose its memory at all.
 
 
-## Overview
+### Enabling Shared-Nothing Linking of WebAssembly Modules
 
-This proposal builds on the following existing and separately proposed 
-high-level WebAssembly concepts:
-* **value type**: the set of types defined by the [core spec][Value Types]
-  that can be used to define globals, locals, functions, etc
-* **module**: the basic unit of WebAssembly code whose structure is defined in
-  the [core spec][Module Syntax] and which may only use value types in its
-  functions
-* **module type**: currently defined by the [core spec][Old Module Type] as a
-  mapping from imports to exports. More recently, there is a [proposal][New Module Type]
-  to generalize module types to include import/export names and have text
-  format parse rules so that module types can be written separately from
-  modules.
-* **known section**: sections defined by the [core spec's binary format][Known Section]
-  which collectively decode a module
-* **custom section**: sections defined by the [core spec's binary format][Custom Section]
-  whose contents are uninterpreted by the core spec but can be interpreted by
-  other tools or specifications (including this proposal)
+While WebAssembly intentionally supports [native dynamic linking]
+(a.k.a. "shared-everything" linking; cf. [shared-everything dynamic linking in
+the Module Linking proposal][shared-everything-example]), this type of linking
+is more fragile:
+* Modules must carefully coordinate (at the toolchain and source level) to
+  share data and generally avoid clobbering each other.
+* Modules must agree on versions for common shared libraries since the
+  libraries' state is generally shared by all clients.
+* Corruption in one module can affect other modules, with certain bugs
+  only manifesting with certain combinations of modules.
+* Modules are less able to encapsulate, leading to unwanted representation
+  dependencies or violations of the Principle of Least Authority.
 
-This proposal defines the following new high-level concepts:
-* **interface type**: a new set of types that describe abstract, high-level values
-* **adapter instruction**: a new set of instructions which may produce or consume
-  values of both value types and interface types
-* **adapter function**: a new set of functions whose signatures may contain
-  interface types and whose bodies are composed of adapter instructions
-* **interface adapter**: a collection of adapter functions that are applied to a
-  module's imports and exports
-* **adapted module**: the result of applying an interface adapter to a module,
-  which encapsulates the core module's imports and exports, exposing only the
-  adapted imports and exports
-* **module interface type**: a superset of the core module type which
-  classifies an adapted module and thus includes function signatures with
-  interface types
-* **interface adapter custom section**: the new custom section defined by
-  this proposal which encodes an interface adapter which is to be applied
-  to the core module defined by the known sections to produce an adapted module
-  that shall be executed by the host in place of the core module
+In contrast, "shared-nothing" linking refers to a linking scheme in which each
+module defines and encapsulates its own memories and tables and, in doing so,
+ensures a degree of isolation that mitigates the sources of fragility listed
+above. However, there is currently no host-independent way to implement even
+basic shared-nothing linking operations like copying an array of bytes from one
+module's linear memory to another.
 
-Collectively, these concepts and their relationships can be visualized together
-in the following diagram:
-
-![Concepts overview diagram](overview.svg)
+With interface types available to use at the boundary between two
+modules, exports and imports can take, e.g., an abstract sequence of bytes,
+or a string, or a sequence of pairs of strings and integers, etc. It is then
+the wasm engine that takes care of copying data between two modules' linear
+memories, allowing all modules to fully encapsulate their state.
 
 
-## Walkthrough
+### Scoping Shared-Everything Linking
 
-> **Note** The syntax and semantics presented below is still very much in flux.
-> Also, there's currently a large number of TODOs, so the walkthrough is
-> definitely incomplete.
+Shared-nothing linking should not, however, be mutually exclusive with
+shared-everything linking: just because two modules don't share state doesn't
+mean they can't share code. Indeed, the [Module Linking] proposal [explicitly
+supports][shared-everything-use-case] having multiple wasm programs that share
+modules, but not memories, but there is no provision for how those independent
+programs can communicate with each other. While they could communicate
+indirectly through a pipe/channel/socket/message API, with Interface Types,
+they should additionally be able to be communicate efficiently through
+synchronous function calls.
 
-The walkthrough starts by introducing the `string` type and then using `string`
-in the parameters and results of first exports and then imports. Afterwards,
-other types and concepts are introduced.
-1. [Export returning string (statically allocated)](#export-returning-string-statically-allocated)
-1. [Export returning string (dynamically allocated)](#export-returning-string-dynamically-allocated)
-1. [Export receiving string](#export-receiving-string)
-1. [Strings in imports](#strings-in-imports)
-1. [Lifting, lowering and laziness](#lifting-lowering-and-laziness)
-1. [Strings with the GC proposal](#strings-with-the-GC-proposal)
-1. [Integers](#integers)
-1. [TODO](#TODO)
+TODO:
+* show diagram that shows two-level topology as desired end-state
+  (using "component")
 
-### Export returning string (statically allocated)
 
-Let's start with a WebAssembly module that you can write today (with 
-[multi-value]) that returns a string that is stored at a fixed location in
-linear memory:
+## Additional Requirements
 
-```wasm
-(module
-  (memory (export "mem") 1)
-  (data (i32.const 0) "hello there")
-  (func (export "greeting_") (result i32 i32)
-    i32.const 0    ;; offset of string in memory
-    i32.const 11   ;; length
-  )
-)
+TODO:
+* Avoid baking in the assumption of linear memory or GC and allow
+  zero-copy when both sides use a compatible, immutable, identity-less
+  GC references.
+* Allow efficient conversion to and from host values (e.g., JS strings)
+  with zero copy possible when both sides agree on representation.
+* Avoid committing to a single value representation for all time (e.g.,
+  string encoding).
+* Avoid unnecessary copies to temporaries and O(n) engine-internal
+  allocations (not in linear or GC memory). Reducing copy overhead allows
+  finer-granularity use of shared-nothing linking, which are, in turn, better
+  for security and composability.
+* Avoid reliance on a sufficiently-smart compiler to optimize effectively;
+  optimization should be enabled by construction.
+* Allow semver-compatible interface evolution with similar expressivity to
+  what is enabled by ProtoBuf without runtime overhead.
+* Avoid fragile ABIs that allow sloppy or out-of-date toolchains to manifest
+  late or hard-to-debug errors when linked with well-behaved new toolchains.
+
+
+## Proposal
+
+The proposal is introduced bottom-up, starting with the new types, then the
+instructions that produce/consume the new types, then the new functions that can
+use the new instructions, then the new kind of module that can contain the new
+functions.
+
+
+### Interface Types
+
+The wasm core spec defines the set [`valtype`] of low-level value types (`i32`,
+`i64`, `f32`, `f64` and a growing set of [reference types], starting with
+`externref` and `funcref`). The Interface Types proposal introduces a *new*
+set `intertype` of *high-level* value types which are mostly disjoint from
+`valtype`. The set `intertype` is inductively generated from the grammar below,
+containing only types of finite nesting (unlike `valtype` which, starting with
+the [function references] proposal, can contain cyclic function types).
+
+```
+intertype ::= f32 | f64
+            | s8 | s16 | s32 | s64 | u8 | u16 | u32 | u64
+            | string
+            | (array <intertype>)
+            | (record (field <name> <id>? <intertype>)*)
+            | (variant (case <name> <id>? <intertype>*)*)
 ```
 
-If we want this module to be ergonomically callable from JS, we'll need to
-wrap this wasm module with a JS module that uses the [JS API] to read the
-strings' bytes from the `mem` export to create a JS string value. Tools like
-[Embind] and [wasm-bindgen] can be used today to generate this glue
-automatically from annotations in C++ and Rust source code, respectively.
+(Note: more types are planned for addition as listed in [TODO](#TODO).)
 
-With this proposal, however, we can use the `string` interface type as the
-result type of our module's export. `string` is defined abstractly as a sequence
-of [Unicode code points] and does not imply a [Unicode encoding scheme]
-or whether the encoded bytes are stored in linear memory, but we can specify
-all this by adding the following to our module:
+Also unlike `valtype`, where reference values refer to mutable state with
+identity and have (non-coercive) subtyping constrained by low-level memory
+layout requirements, `intertype` values are transitively immutable and
+subtyping has coercion semantics that allow more flexible subtyping. Since
+copying is essential to the use of interface types in the first place,
+coercions can be folded into the copy at little, if any, extra cost. The type
+constructors of `intertype` are summarized as follows:
 
-```wasm
-  (@interface func (export "greeting") (result string)
-    call-export "greeting_"
-    memory-to-string "mem"
-  )
+| Type Constructor | Description of values | Subtyping allowed |
+| ---------------- | --------------------- | ---------------- |
+| `f32`, `f64` | same as core wasm | `f32 <: f64` |
+| `s8`, `u8`, `s16`, `u16`, `s32`, `u32`, `s64`, `u64` | explicitly signed, ranged integer values | `I1 <: I2` if `I1`'s range is included in `I2`'s |
+| `string` | a list of [Unicode scalar values] | |
+| `array` | a list of homogeneous `intertype` values with eagerly-computed length | `(array T) <: (array T')` if `T <: T'` |
+| `record` | a tuple of named heterogeneous values | `(record Tᵢ*) <: (record T'ᵢ)` if `Tᵢ <: T'ᵢ`, matched by name, allowing `T` to have extra, ignored fields |
+| `variant` | a discriminated union of named heterogeneous tuples of values | `(variant Tᵢ*) <: (variant T'ᵢ)` if `Tᵢ <: T'ᵢ`, matched by name, allowing `T'` to have extra, ignored cases |
+
+An example type using these type constructors together is:
+```
+(array
+  (record
+    (field "person"
+      (record
+        (field "name" string)
+        (field "age" u8)))
+    (field "mood"
+      (variant
+        (case "happy")
+        (case "sad")))))
+```
+Should consumers of this type wish to start considering ages beyond 256 or moods
+beyond these two, due to the flexible subtyping rules, consumers of this type
+can backwards-compatibly switch from `u8` to `u16` and add cases to the variant.
+
+While `variant` is sufficiently general to capture a number of more-specialized
+types that often arise in programming languages, it can still be beneficial for
+toolchains to have these specialized types represented explicitly as interface
+types. Thus, three text-format and binary-format [abbreviations] are included.
+As with the existing wasm text format, the abbreviation on the left-hand side of
+the `≡` is expanded during parsing to the right-hand side. Analogous decoding
+rules are added to binary format.
+```
+                             bool ≡ (variant (case "True") (case "False"))
+             (option <intertype>) ≡ (variant (case "None") (case "Some" <intertype>))
+(result <intertype> <intertype>?) ≡ (variant (case "Ok" <intertype>) (case "Error" <intertype>?))
+```
+Given these abbreviations, a toolchain generating source-level declarations for
+an interface-typed API can generate the more-specialized (and often more
+concise and efficient) source-language types corresponding to `bool`, `option`
+and `result`.
+
+
+### Lifting and Lowering Instructions
+
+Along with each interface type, the proposal adds new instructions for producing 
+and consuming the interface type. These instructions fall into two categories:
+* **Lifting instructions** produce interface types, going from
+  lower-level types to higher-level types.
+* **Lowering instructions** consume interface types, going from higher-level
+  types to lower-level types.
+
+Lifting and lowering instructions thus act as the "bridge" between core wasm and
+interface types and their instruction signatures include types from both
+`valtype` and `intertype`. By having the conversion between `valtype` and
+`intertype` explicit and programmable, this proposal allows for a wide gamut
+of low-level value representations to be passed directly *in situ* (without the
+wasm module performing an intermediate serialization step) and for this set of
+options to grow over time.
+
+As with core wasm instructions, lifting and lowering instructions can dynamically
+fail and, when they do, they do so by trapping. In the future, alternative failure
+options (like throwing an [exception]) may be added.
+
+The following subsections list the initial proposed set of lifting and lowering
+instructions, grouped by interface type.
+
+#### Integers
+
+Similar to the core wasm numeric conversions, a matrix of integral conversion
+instructions are given which allow converting between the 2 sign-less core
+wasm integer types and the 8 explicitly-signed integral interface types:
+```
+uX.from_iY : [iY] -> [uX]
+sX.from_iY : [iY] -> [sX]
+iY.from_uX : [uX] -> [iY]
+iY.from_sX : [sX] -> [iY]
+where
+ - X is one of 8, 16, 32 or 64
+ - Y is one of 32 or 64
 ```
 
-The statement begins with `@interface` since it is not part of the [core spec]
-text format (as recommended by the [Custom Annotation] proposal). This `func`
-statement defines two things:
-* an export `greeting` in the [adapted module](#Overview) whose result is the
-  `string` interface type
-* an [adapter function](#Overview) that implements `greeting`
+If the destination bitwidth is smaller than the source bitwidth and the dynamic
+value is outside of the destination's range (determined by the explicit
+signedness of the instruction), the instruction traps.
 
-While the set of *instructions* in the body of the adapter function is
-distinct from the set of [core wasm instructions][Instructions],
-the overall *structure* of the adapter module is the same as a core WebAssembly
-function. In particular:
-* The adapter function body is a (possibly nested) sequence of instructions.
-* Instructions are defined to pop operands and push results onto the stack.
-* Validation checks that the types of instructions' signatures line up.
-* Instructions can either be written as a linear sequence (as shown above)
-  or, equivalently, as [Folded S-expressions].
-* The set of instructions is fixed by the specification, but growable over time
-  by proposing extensions to the specification.
-
-The specific adapter function shown above uses two adapter instructions:
-* The `call-export` instruction calls the `greeting_` export of the core wasm
-  module which leaves two `i32` values on the stack.
-* The `memory-to-string` instruction pops the two `i32` values, reads and
-  decodes UTF-8 bytes from `mem`, and pushes the resulting `string` value.
-
-Having added this adapter function, the `.wat` file now defines an [adapted module](#Overview)
-with no imports and whose only export is the (adapted) `greeting` export.
-Importantly, the `greeting_` and `mem` core-module exports are not exported
-from the adapted module: they are fully encapsulated by the adapted module.
-While it is possible for an adapted module to re-export core-module exports,
-this must be explicitly specified with an `@interface` statement.
-
-Another note is that, since `greeting_` and `greeting` are in separate export
-namespaces (of the core and adapted modules, resp.), they could have the same
-name. The trailing underscore is only added for clarity in this walkthrough.
-
-### Export returning string (dynamically allocated)
-
-The previous section's example has the simplifying property that the string is
-statically allocated. What happens if `greeting_` wants to `malloc` the
-resulting string? For example:
-
+For example, the following instruction sequence gives an explicit sign to an
+otherwise-ambiguous `i32` with its high-bit set:
 ```wasm
-(module
-  (memory (export "mem") 1)
-  (func $malloc (param i32) (result i32) ...)
-  (func (export "free") (param i32) ...)
-  (func (export "greeting_") (result i32 i32)
-    ;; compute allocation size
-    call $malloc
-    ;; initialize malloc'd memory with string
-    ;; return pointer and length
-    ;; caller must call "free" when done with the string
-  )
-)
+i32.const 0x80000000  ;; push i32
+u32.from_i32  ;; pop i32, push u32
 ```
 
-This situation would naturally arise when exporting, e.g., a C++ function that
-returns a `std::string` or `std::shared_ptr<char[]>`. In both cases, the
-returned C++ object essentially contains a pointer along with the assumption
-that the calling C++ code is responsible for calling the object's destructor,
-which then frees the memory or drops a reference count, resp. But if that
-function is exported from an adapted wasm module, the caller isn't C++ code,
-it's the adapter function.
+#### Strings
 
-What we need is to be able to call `free` (or some other export corresponding
-to a destructor) after the linear memory bytes are read by `memory-to-string`.
-Because there is no limitation on the number of `call-export`s in an adapter
-function, a first attempt at a solution would be to just call `free` directly:
+Recalling that strings are lists of abstract [Unicode scalar values], all
+string lifting and lowering instructions need to specify a concrete encoding.
+For broad coverage across a wide set of languages and string representations,
+the initial proposal contains two encodings: UTF-8 and UTF-16.
 
-```wasm
-  (@interface func (export "greeting") (result string)
-    call-export "greeting_"
-    dup
-    memory-to-string "mem"
-    swap
-    call-export "free"
-  )
+The three string lifting and lowering instructions and their signatures are:
 ```
-
-Here we use classic stack manipulation operations to duplicate the `i32` pointer
-value so that it can be read by both `memory-to-string` and the call to `free`.
-Unfortunately, there is a problem: anticipating the [exception handling]
-proposal, if an exception is thrown between the `call-export "greeting_"` and
-the `call-export "free"`, the memory will be leaked. With more complicated
-exported function signatures, there can be many instructions in this range
-which can throw.
-
-To address this problem, as well as another problem described [below](#lifting-lowering-and-laziness) 
-there is a `defer-call-export` instruction:
-
-```wasm
-  (@interface func (export "greeting") (result string)
-    call-export "greeting_"
-    defer-call-export "free"
-    memory-to-string "mem"
-  )
+string.lift_memory <encoding>? <memory>? : [i32, i32] -> [string]
+string.size <encoding>? : [string] -> [i32]
+string.lower_memory <encoding>? <memory>? : [i32, string] -> []
 ```
+When absent:
+* the default `<encoding>` is UTF-8
+* the default `<memory>` is 0
 
-This instruction requests that the given function (`free`) be called on all
-exits from the current frame (normal and exceptional). The arguments for
-this deferred call are copied from the top of the stack at the time of the
-`defer-call-export` (the number and types of which are determined by the
-callee signature, like a normal wasm `call`). Unlike a normal wasm `call`,
-however, these arguments aren't popped, but left on the stack, which is
-especially convenient for the common case shown here.
+The `string.lift_memory` produces a `string` by decoding it from the linear
+memory identified by `memory` according to the [Encoding API] for `encoding`
+with the [error mode] set to `fatal`. If decoding results in a failure (with
+causes including the presence of surrogate code points), `string.lift_memory`
+traps.
 
-### Export receiving string
+The `string.size` is used to query how much memory `string.lower_memory`
+will require to encode the given `string` so that the containing code can
+allocate enough.
 
-Now what if instead our module needs to take a string as a parameter? This
-can be handled symmetrically using the `string-to-memory` adapter
-instruction, as shown in this example:
-
-```wasm
-(module
-  (memory (export "mem") 1)
-  (func (export "malloc") (param i32) (result i32) ...)
-  (func (export "free") (param i32) ...)
-  (func (export "log_") (param i32 i32) ...)
-  (@interface func (export "log") (param $str string)
-    arg.get $str
-    string-to-memory "mem" "malloc"
-    call-export "log_"
-  )
-)
-```
-
-Here, the `string` value is a parameter. Like core WebAssembly, arguments are
-not automatically pushed on the stack and must be pushed explicitly, here using
-the `arg.get` adapter instruction.
-
-The `string-to-memory` instruction then:
-* pops the string off the stack
-* computes the number of bytes to encode the string in UTF-8
-* calls the given `malloc` exported function to allocate that number of bytes
-* UTF-8-encodes the string into `mem` at the offset returned by `malloc`
-* pushes both the offset and number of bytes as two `i32`s on the stack
-
-An important technicality is that the `string` interface type is a sequence of
-[Unicode code points] while UTF-8 only encodes a sequence of [Unicode scalar values].
-Thus `string` allows [surrogate code points] which is imporant later in
-[Web IDL Integration](#web-idl-integration). However, this also means that
-`string-to-memory` needs to define what happens if a surrogate code point is
-encountered while encoding. On the Web, UTF-8 [encoding][WHATWG Encoding] is
-defined to replace lone surrogates with the [Replacement Character]. Encoding
-the surrogate code point directly ([WTF-8]) is another option. Trapping is a
-conservative third option. The `string-to-memory` instruction could allow all 3
-options, specified as another immediate, with a specified default in the text
-format.
-
-A related question is whether non-UTF-8 encodings should be supported. While
-there are [ecosystem benefits](http://utf8everywhere.org/) to allowing only UTF-8,
-there may (one day) be practical reasons to support other encodings with either
-new instructions or adding a new flag bit to `string-to-memory`.
-
-### Strings in imports
-
-The proposal also allows adapting imports as well. For example, to import a
-logging function that takes a string:
-
-```wasm
-(module
-  (memory (export "mem") 1)
-  (func (import "" "log_") (param i32 i32))
-  ...
-  (@interface func $log (import "" "log") (param $arg string))
-  (@interface implement (import "" "log_") (param $ptr i32) (param $len i32)
-    arg.get $ptr
-    arg.get $len
-    memory-to-string "mem"
-    call-import $log
-  )
-)
-```
-
-The first `@interface` statement defines an import in the adapted
-module and thus has no body (it's an import). Note that the syntax for
-`@interface func` imports and exports are symmetric to core wasm `func`
-imports and exports.
-
-The second `@interface` statement uses `implement` to indicate that
-it is defining an adapter function to implement the *core module* import with
-the given name and signature (in the example, `log_ : [i32,i32] → []`).
-
-This example uses the `memory-to-string` instruction that was previously shown
-in an export adapter function; now `memory-to-string` is applied to the
-*argument* of `call-import` instead of to the *return value* of `call-export`.
-Note also that there is no `defer-call-export "free"` instruction in this
-example. While it would be *possible* to do so, since the caller of the adapter
-is wasm code, it's simpler and potentially more efficient to let the caller
-worry about when to free the string.
-
-Using `string` as the return value of an import is symmetric to above,
-using the previously-introduced `string-to-memory` instruction.
-
-```wasm
-(module
-  (memory (export "mem") 1)
-  (func (export "" "malloc") (param i32) (result i32) ...)
-  (func (import "" "greeting_") (result i32 i32))
-  ...
-  (@interface func $greeting (import "" "greeting") (result string))
-  (@interface implement (import "" "greeting_") (result i32 i32)
-    call-import $greeting
-    string-to-memory "mem" "malloc"
-  )
-)
-```
-
-### Lifting, lowering and laziness
-
-With `memory-to-string` and `string-to-memory`, we can see a pattern that will
-be repeated for all subsequent interface types: there is one set of **lifting
-adapter instructions** that "lift" core wasm values into interface-typed values
-and another set of **lowering adapter instructions** that "lower" interface-typed
-values into core wasm values. Moreover, the validation rules for adapter
-instructions ensure that the *only* way to consume an interface-typed value
-is with a lowering instruction.
-
-With the 2×2 matrix of {lifting,lowering}×{import,export} covered for `string`,
-we can now examine a complete example of [shared-nothing linking](#Motivation).
-On the provider side, we have an adapted module that exports a function `get`
-which takes and returns a string:
-
-```wasm
-(module
-  (memory (export "mem1") 1)
-  (func (export "mem1Malloc") (param i32) (result i32) ...)
-  (func (export "mem1Free") (param i32) ...)
-  ...
-  (func (export "get_") (param i32 i32) (result i32 i32) ...)
-  (@interface func (export "get") (param $key string) (result string)
-    arg.get $key
-    string-to-memory "mem1" "mem1Malloc"
-    call-export "get_"
-    defer-call-export "mem1Free"
-    memory-to-string "mem1"
-  )
-)
-```
-
-On the client side, we have an adapted module that imports and calls `get`:
-
-```wasm
-(module
-  (memory (export "mem2") 1)
-  (func (export "mem2Malloc") (param i32) (result i32) ...)
-  ...
-  (func $get_ (import "" "get_") (param i32 i32) (result i32 i32))
-  (@interface func $get (import "kv-store" "get") (param string) (result string))
-  (@interface implement (import "" "get_") (param $ptr i32) (param $len i32) (result i32 i32)
-    arg.get $ptr
-    arg.get $len
-    memory-to-string "mem2"
-    call-import $get
-    string-to-memory "mem2" "mem2Malloc"
-  )
-  (func $randomCode
-    ...
-    call $get_
-    ...
-  )
-)
-```
-
-Looking at this example, an important question is: will the engine be able
-to copy directly between the caller's and callee's linear memories for the
-parameter and result strings? If `memory-to-string` had the same [eager evaluation]
-rules as all core wasm instructions, the answer would be "probaly not", because
-any unknown side effects between `memory-to-string` and `string-to-memory` (such
-as the calls to `mem1Malloc` and `mem2Malloc`) could force the engine to
-conservatively make intermediate copies.
-
-To solve this problem and categorically remove all such intermediate copies,
-lifting instructions are specified to be evaluated [lazily]. "Lazily" means 
-that `memory-to-string` doesn't read the source linear memory until the point
-at which the resulting `string` is lowered by `string-to-memory`. If the
-`string` result is never lowered, the source memory is never read. If the
-`string` is lowered multiple times, the source memory is read anew each time.
-
-While the implementation of lazy evaluation in a general-purpose programming
-language may add runtime overhead (e.g., requiring values to be represented
-by [thunks]), in the restricted, declarative setting of adapter functions, a
-pair of adapted modules can *always* be [partially evaluated] into a single
-core wasm module that contains no adapter instructions, using core wasm
-instructions like [`memory.copy`] to copy directly from memory to memory.
-This partial evaluation will be formalized as a set of provably-equivalent
-rewrite rules which engines can use to *predictably* optimize adapter
-function code into equivalent core wasm code (at instantiation time, when
-client and provider are known).
-
-For example, the above two adapted modules can be merged and rewritten into the
-following core wasm module (using the [multi-memory] proposal and the `let`
-blocks introduced by the [function references] proposal):
-
-```wasm
-(module
-  (memory $mem1 1)
-  (memory $mem2 1)
-  (func $mem1Malloc (param i32) (result i32) ...)
-  (func $mem1Free (param i32) ...)
-  (func $mem2Malloc (param i32) (result i32) ...)
-  ...
-  (func $validateUtf8 (param i32 i32) ... defined by Unicode spec ...)
-  ...
-  (func $get_ (param i32 i32) (result i32 i32) ...)
-  (func $get (param $keySrc i32) (param $keyLen i32) (result i32 i32)
-    (call $validateUtf8 (local.get $keySrc) (local.get $keyLen))
-    (call $mem1Malloc (local.get $keyLen))
-    let (local $keyDst i32) (result i32 i32)
-      (memory.copy "mem2" "mem1" (local.get $keyDst) (local.get $keySrc) (local.get $keyLen))
-
-      (call $get_ (local.get $keyDst) (local.get $keyLen))
-
-      let (local $valSrc i32) (local $valLen i32) (result i32 i32)
-        (call $validateUtf8 (local.get $keySrc) (local.get $keyLen))
-        (call $mem2Malloc (local.get $valLen))
-        let (local $valDst i32) (result i32 i32)
-          (memory.copy "mem1" "mem2" (local.get $valDst) (local.get $valSrc) (local.get $valLen))
-
-          (call $mem1Free (local.get $valSrc))
-
-          local.get $valDst
-          local.get $valLen
-        end
-      end
-    end
-  )
-  (func $randomCode
-    ...
-    call $get
-    ...
-  )
-)
-```
-
-Some interesting things to notice in this code are:
-* For the special case of strings, in addition to copying memory, UTF-8
-  validation is required at the interface boundary since the engine has no way
-  to know that the source bytes are already valid.
-* While the original client and provider modules needed to export memory and
-  various functions so that they can be used by the containing adapted module,
-  the rewritten module can keep these encapsulated and use module-internal
-  references.
-* The `defer-call-export` in the original adapted module has been
-  rewritten into a plain `call` at the end of the rewritten function scope.
-  `defer-call-export` can be thought of as a lazily-evaluated call, with
-  evaluation occurring at the end of its (post-rewrite) enclosing scope. Thus,
-  `defer-call-export` is naturally aligned with lazy lifting, ensuring that
-  memory is still allocated when it is read.
-
-
-### Strings with the GC proposal
-
-In the preceding [shared-nothing example](#lifting-lowering-and-laziness),
-neither module exposes its linear memory or allocator functions to the outside
-world, keeping these encapsulated inside their respective adapted modules. In
-fact, with the future [GC] proposal, either module can transparently switch to
-GC without the other module noticing. For example, using the strawman GC text
-format, and assuming a new lifting instruction, `gc-to-string`, and a new
-lowering instruction, `string-to-gc`, the above provider module could be
-transparently rewritten to use GC:
-
-```wasm
-(module
-  (type $Str (array i8))
-  (func (export "get_") (param (ref $Str)) (result (ref $Str)) ...)
-  ...
-  (@interface func (export "get") (param $key string) (result string)
-    arg.get $key
-    string-to-gc
-    call-export "get_"
-    gc-to-string
-  )
-)
-```
-
-This example shows how having explicit adapter instructions allows new
-representation choices to be added over time. Moreover, the provider module is
-not required to make an all-or-nothing choice; individual parameters can use
-whichever available representation is best.
-
-### Integers
-
-In addition to `string`, the proposal includes the integer types `u8`, `s8`,
-`u16`, `s16`, `u32`, `s32`, `u64` and `s64`. Each of these types represent
-subsets of ℤ, the set of all integers, with `uX` types representing ranges 
-[0, 2<sup>X</sup>-1] and `sX` types representing ranges
-[-2<sup>X-1</sup>,2<sup>X-1</sup>-1]. Since values of these types are proper
-integers, not bit sequences like core wasm `i32` and `i64` values, there is no
-additional information needed to interpret their value as a number.
-
-As with strings, the integral types have associated lifting and lowering
-instructions `lift-int` and `lower-int`, which take the source and destination
-type as explicit immediates, as with the [`block`][Block Validation]
-and [`select`][Select Validation] instructions. For example:
-
+For example, a C-style (null-terminated) string could be lifted via the
+expression (using `let` as proposed in the [function references] proposal):
 ```wat
-(module
-  (func (export "compute_") (param i64 i32) (result i32) ...)
-  ...
-  (@interface func (export "compute") (param s8 u64) (result s64)
-    arg.get 0
-    lower-int s8 i64
-    arg.get 1
-    lower-int u64 i32
-    call-export "compute_"
-    lift-int i32 s64
-  )
+let (result string) (local $ptr i32)
+  local.get $ptr  ;; push source address
+  (call $strlen (local.get $ptr))  ;; push source length
+  string.lift_memory  ;; read string from source
+end
+```
+
+Conversely, a C-style string could be lowered via the expression:
+```wat
+let (result i32) (local $str string)
+  (call $malloc_cstr (string.size (local.get $str)))  ;; push destination address
+  local.get $str  ;; push source string
+  string.lower_memory  ;; copy source into destination address
+end
+```
+where `$malloc_cstr` is a function that wraps `$malloc` by adding 1 to the
+requested byte count and initializing the final byte to null before return.
+
+#### Records
+
+Records are simply tuples of smaller interface values and thus can be produced
+and consumed by simple stack operations:
+```wasm
+record.lift $R : [$F*] -> [$R]
+record.lower $R : [$R] -> [$F*]
+where
+  - $R refers to a (record (field <name> $F)*)
+```
+
+For example, given a type definition of a record type:
+```wasm
+(type $Coord (record (field "x" s32) (field "y" s32)))
+```
+a `$Coord` value can be lifted from two `i32`s by the instruction sequence:
+```wasm
+(s32.from_i32 (i32.const 1))  ;; push s32
+(s32.from_i32 (i32.const 2))  ;; push s32
+record.lift $Coord  ;; pop two s32s, push record
+```
+and lowered back into two `i32`s by the instruction sequence:
+```wasm
+record.lower $Coord  ;; pop record, push two s32s
+let (result i32 i32) (local $x s32) (local $y s32)  ;; pop s32s into locals
+  (i32.from_s32 (local.get $x))  ;; push i32
+  (i32.from_s32 (local.get $y))  ;; push i32
+end
+```
+
+#### Arrays
+
+The initial lifting and lowering instructions of arrays are oriented towards contiguous
+allocations. In the future, more sophisticated instructions could be used for producing
+and consuming arrays with other segmented representations.
+
+The array lifting instruction's signature is:
+```wasm
+array.lift T* $A <instr>* end : [T*, i32] -> [$A]
+where:
+  - $A refers to an (array E)
+  - <instr>* : [i32] -> [E]
+```
+This instruction is effectively a loop; given an `i32` pair `(begin, count)`, it
+executes the `<instr>*` body `count` times, passing the body an `i32` that
+starts at `begin` and is incremented by `stride` on each successive iteration.
+
+Array lowering is similar to string lowering in that two instructions are used:
+one to determine how much memory to allocate, and one to lower into the
+already-allocated memory:
+```wasm
+array.count $A : [$A] -> [i32]
+array.lower T* $A <instr>* end : [T*, $A] -> [T*]
+where
+  - $A refers to an (array E)
+  - <instr>* : [T*, E] -> [T*]
+```
+As with lifting, `array.lower` is effectively a loop, executing the `<instr>*`
+body `array.count` times, passing an `i32` that starts at initial `i32` passed in
+and is incremented by `stride` on each successive iteration.
+
+For example, given a type definition of an array type:
+```wasm
+(type $Coord (record (field "x" s32) (field "y" s32)))
+(type $Points (array $Coord))
+```
+a `$Points` value can be lifted from a pointer to a contiguous array of `i32` pairs:
+```wasm
+array.lift $Points 8  ;; pop source address and length
+  ;; i32 element pointer has been pushed on entry
+  let (result $Coord) (local $elemPtr i32)
+    s32.from_i32 (i32.load (local.get $elemPtr))
+    s32.from_i32 (i32.load offset=4 (local.get $elemPtr))
+    record.lift $Coord  ;; convert two s32s on the stack to the record element
+  end
+end  ;; on exit, a record element must have been pushed
+```
+and lowered back into the same:
+```wasm
+let (local $arr $Points)
+  (call $malloc (i32.mul (array.count (local.get $arr)) (i32.const 8))  ;; alloc destination
+  local.get $arr
+  array.lower $Points 8  ;; pop destination pointer and array
+    ;; i32 element pointer and element value have been pushed on entry
+    let (local $elemPtr i32) (local $coord $Coord)
+      (record.lower $Coord (local.get $coord))  ;; decompose element into fields
+      (i32.store (local.get $elemPtr))
+      (i32.store offset=4 (local.get $elemPtr))
+    end
+  end
+end
+```
+With this design, implementations have a fair amount of flexibility determining
+the representation of the low-level array being lifted or lowered. For example,
+elements could be stored either in-line (with arbitrary padding and packing) or
+out-of-line (as a owned or reference-counted pointer) or something in-between.
+Moreover, the lifting and lowering don't have to have the same representation
+since both meet at the `array` type in the middle.
+
+#### Variants
+
+Variants are the dual of records (records being [product types] and variants
+being [sum types]). Like arrays, variant lifting and lowering needs to
+perform control flow and thus variant instructions have nested body expressions
+just like array instructions.
+
+The initial lifting instruction of variants is oriented towards using a dense
+`i32` index to discriminate the variant. Calls into core wasm can be used
+before the lifting instruction to map arbitrary discrimant representations to a
+dense `i32`. In the future, more sophisticated instructions could be added
+that allow inline testing using arbitrary expressions. The variant lifting
+instruction's signature is:
+```wasm
+variant.lift <valtype>* $V <instr>* end : [<valtype>*] -> [$V]
+where
+ - $V refers to a (variant (case <name> C*)*)
+ - <instr>* : [<valtype>*] -> [C<sub>last</sub>]
+```
+The `i32` flowing into the `variant.lift` instruction is used to select which
+`$case` to execute, with a value of `0` selecting the first case, `1` selecting
+the second, etc, with the last `$case` being selected by default for all other
+values. Since variant subtyping allows arbitrary reordering, a module is always
+able to choose the appropriate default case for itself.
+
+The variant lowering instruction's signature is:
+```wasm
+variant.lower <valtype1>* $V <valtype2>* [case <instr>* end]* : [<valtype1>* $V] -> [<valtype2>*]
+where
+ - $V refers to a (variant (case <name> C*)*)
+ - the number of cases in $V and variant.lower's body is the same
+ - for each case: <instr>* : [<valtype1>* C*] -> [<valtype2>*]
+```
+This instruction allows arbitrary values to flow into and out of the cases,
+which enables multiple lowering implementation strategies: writing into
+an already-allocated memory location that is passed in or producing new values
+that flow out.
+
+For example, given a type definition for variant that encodes an optional
+coordinate argument:
+```wasm
+(type $Coord (record (field "x" s32) (field "y" s32)))
+(type $MaybeCoord (variant (case "None") (case "Some" $Coord)))
+```
+a `$MaybeCoord` value can be lifted from a pointer that is either null (which
+conveniently has the `i32` value `0`) or a pointer to a pair of `i32`s:
+```wasm
+variant.lift $MaybeCoord  ;; pops one i32
+  case  ;; the "None" case if the i32=0 (the i32 is left on the stack)
+    drop
+  end  ;; on case exit, "None" requires the stack be empty
+  case  ;; the "Some" case if the i32!=0 (the i32 is left on the stack)
+    let (result $Coord) (local $ptr i32)
+      (i32.load (local.get $ptr))  ;; load the record's fields
+      (i32.load offset=4 (local.get $ptr))
+      record.lift $Coord
+    end
+  end  ;; on case exit, "Some" requires a single $Coord value on the stack
+end
+```
+and lowered back into the same:
+```wasm
+variant.lower $MaybeCoord i32  ;; pops a variant from the stack
+  case  ;; for the "None" case, the stack is empty on entry
+    i32.const 0  ;; push a null pointer
+  end  ;; all cases must end with an i32 on the stack
+  case  ;; for the "Some" case, the stack contains a $Coord on entry
+    (call $malloc (i32.const 8))  ;; allocate destination pointer
+    let (param $Coord) (result i32) (local $ptr i32)
+      record.lower $Coord  ;; decompose element into fields
+      i32.store (local.get $ptr)
+      i32.store offset=4 (local.get $ptr)
+      local.get $ptr
+    end
+  end ;; all cases must end with an i32 on the stack
+end
+```
+Alternatively, the indirection and `$malloc` could be avoided by representing
+`$MaybeCoord` as 3 scalar `i32`s that get passed into `variant.lift` and out
+of `variant.lower`. Moreover, the lifting and lowering can use different
+representations since they meet at the `variant` type in the middle.
+
+
+### Adapter Functions
+
+Because the Interface Types proposal is *layered* on the core wasm spec (in
+the same manner as the [JS API], [C API] and [Web API]), the new types and
+instructions introduced above can't simply be used in core wasm functions
+because core wasm functions can only contain *core* wasm types and instructions.
+Instead, the proposal defines a *new kind* of function, distinct from existing
+core wasm functions, called an **adapter function**. Adapter functions have the
+same structure as core functions but allow a different set of types and
+instructions.
+
+For types, adapter functions allow a superset of the core wasm `valtype`:
+```
+adaptertype ::= valtype | intertype
+```
+By allowing a mix of both `valtype` and `intertype`, adapter functions enable
+the use of lifting and lowering instructions, which manipulate both.
+
+Similarly, for instructions, adapter functions allow a superset of the core
+wasm [`instr`]:
+```
+adapterinstr ::= instr | new instructions in this proposal
+```
+
+TODO: rewrite this
+
+For instructions, adapter functions do *not* similarly extend the core wasm
+set of instructions ([`instr`]) with lifting and lowering instructions. The
+reason is that adapter functions are designed to ensure a new property that is
+not in general ensured by core wasm functions:
+
+> The **Single Reaching Lift (SRL)** property requires that each use of an
+> interface type is reached by exactly one lifting instruction definition.
+
+The reason the SRL property is valuable is described in more detail in a
+[later section](#lazy-lifting-avoiding-intermediate-copies-by-design), but a
+short summary is that SRL allows guaranteed elimination of intermediate copies
+without relying on compiler magic. 
+
+TODO: what we need is:
+* since we're importing core instruction validation/execution, they reject
+  `intertype` types and values.
+  * Exception: `drop` works, b/c it's polymorphic. `select` does not.
+* `intertype` values may only be manipulated by new instructions
+* lifting, lowering are new, preserve SRL
+* enhanced:
+  * call: require non-recursive --> inline
+  * let: simply allow intertype
+  * local.set: not allowed for intertype
+
+To ensure SRL, adapter functions start with `instr` and remove all the
+[control instructions] with the exception of:
+* `unreachable`, since traps cannot rejoin
+* `throw` (but not `try`), when [exception handling] is added
+* `call`, by restricting it to be non-recursive and then interpreting the
+  callee to be inlined into the caller
+
+This definition is fairly conservative and could even be loosened, while
+preserving SRL, to allow blocks and branches when  interface types were not
+present in the block types.
+
+With this restriction in place, a new set `adapterinstr` is defined which
+contains the remainder of `instr` extended with the new instructions added
+by this proposal.
+
+With `valtype` replaced by `adaptertype` and `instr` replaced by
+`adapterinstr`, adapter functions work just like core wasm functions. For
+example, the following is a trivial adapter function:
+```wasm
+(func (result s8)
+  i32.const 42
+  s8.from_i32
 )
 ```
 
-Here we can see all the interesting possibilities:
-* `lower-int s8 i64` converts a signed integer in the range [-128,127] to a
-  64-bit value by sign-extension due to the signedness of the source type.
-* `lower-int u64 i32` converts an unsigned value in the range [0, 2<sup>64</sup>-1]
-  to a 32-bit value by truncation.
-* `lift-int i32 s64` converts a 32-bit value to an integer in the range
-  [-2<sup>63</sup>,2<sup>63</sup>-1] by sign-extension due to the signedness of
-  the destination type.
+In general, we can categorize adapter functions into three categories:
 
-> **NOTE** In the future we could consider supporting the more general set of
-> (u|s)\<bitwidth\> types, supporting more precise static interface contracts.
-> The current set is chosen for it's practical application to C and Web IDL.
+**Export adapter functions** use only `intertype` in their signatures and use
+lifting and lowering instructions to wrap a call a core wasm function. An
+example export adapter function is:
+```wasm
+(func $print_adapter (param $msg string)
+  (call $malloc_cstr (string.size (local.get $msg)))
+  let (local $cstr i32)
+    (string.lower_memory (local.get $cstr) (local.get $msg))
+    call $core_print
+  end
+)
+```
+
+**Import adapter functions** use only `valtype` in their signatures and use
+lifting and lowering instructions to wrap a call to an imported function
+that only uses `intertype` in its signature. An example import adapter function
+is:
+```wasm
+(func $log_adapter (param $msgPtr i32) (param $msgLen i32)
+  (string.lift_memory (local.get $msgPtr) (local.get $msgLen))
+  call $imported_log
+)
+```
+
+**Helper adapter functions** contain an arbitrary mix of types and are used
+to implement export and import adapter functions. An example might be a
+helper function that lifts a C-string and thus be used by both an
+export adapter (for lifting parameters) or an import adapter (for lifting
+results):
+```wasm
+(func $lift_cstring (param $cstr i32) (result string)
+  local.get $cstr
+  (call $strlen (local.get $cstr))
+  string.lift_memory
+)
+```
 
 
-### TODO
+### Components
 
-This rough list of topics is still to be added in subsequent PRs:
-* bool
-* records
-* sequences (esp. considering interactions with defer)
-* variants
-* closures and interaction with [function references]
-* re-importing/exporting core module import/exports
-* importing an interface type with [type imports]
-* subtyping
+TODO:
+* ok, we have a new kind of adapter function, where does it go?
+  * can't go in existing core wasm section (b/c layered spec)
+* put it in a custom section?
+  * well, we also need new types, new imports, new exports, ...
+  * it'd be like a whole mini-module
+  * and how do we "link" it to the core module?
+* fundamentally, interface types "wraps" the core wasm spec
+* so we define a new kind of "interface type" module that wraps a core module
+* "interface type module" sounds bad, so call it **component** (historical reason...)
+* components contain
+  * type section, allowing core and interface types
+  * import section: no memory/table/global, intertyped function, modules and components
+  * function+code section: only adapter functions
+  * start section
+  * export section: only functions with `intertype` signatures
+  * module/modulecode section: nested module or component instances
+  * instance section: instantiation of modules or components
+  * alias section: alias either module or component instances
+* Examples
+* Note on validation: allow function section in the mix
+  * Component instances created *before* nested instances
+  * Nested instances are stateful
+  * Calling export of nested instance before created traps
+  * Component start function called after last nested instance created
+* Binary format
+  * core wasm module physically embedded (in chars/bytes).  Just like .wast embeds .wat
+  * can reuse the same text/binary parser/decoder and validator: just conditionalize on "kind"
+    * in text format: `component`
+    * in binary format: split "version" `u32` into `version` and `kind` `u16`s, use new `kind`
 
 
-## Web IDL integration
+### Lazy Lifting: Avoiding Intermediate Copies By Design
 
-One of the primary motivations of this proposal is to allow efficient
-calls to Web APIs through their Web IDL interface. The way this is to be
-achieved is by extending the Web IDL specification to include a "WebAssembly
-binding" section which describes how WebAssembly types (including the new
-interface types added by this proposal) are converted to and from Web IDL
-types.
+One of the [Additional Requirements](#additional-requirements) mentioned above
+is to avoid intermediate O(n) copies when using Interface Types. Without
+further nuance, the instructions presented in the previous section would appear
+to violate that requirement by requiring an intermediate copy to reify
+`interval` values between lifting and lowering.
+
+For example, in the following instruction sequence:
+```wasm
+(string.lift_memory (call $create_string))
+...
+let (local $str string)
+  (call $malloc (string.size (local.get $str)))
+  local.get $str
+  string.lower_memory
+  ...
+end
+```
+while we might hope that the wasm engine would be able to copy directly
+from the source memory passed to `string.lift_memory` to the destination
+memory passed to `string.lower_memory`, from the engine's perspective, the
+intervening call to `$malloc` may mutate the linear memory read by
+`string.lift_memory` and thus an intermediate copy must be made just in case.
+This is also the simplest possible case, so we can conclude that, without
+any help, most interface-typed values would end up with an intermediate copy.
+
+The root problem here is that standard [eager evaluation] semantics specify
+the order effects to be:
+1. read from linear memory
+2. perform arbitrary side effects
+3. write to linear memory
+
+What we'd like is to reorder steps 1 and 2 so that the read was always
+immediately followed by the write. But...
+
+TODO:
+* these will practically almost always be in separate adapter functions, so we
+  just can't do that.
+* what we need is to somehow change the *spec* so that the read always happened
+  *right before* the write
+* How? We can employ a less-common evaluation strategy called [lazy evaluation],
+  but only for lifting instructions.
+* The idea behind lazy evaluation is ...
+* Haskell has this. Often coupled with purity, so reordering is unobservable.
+  Laziness + Side Effects usually equals madness, but in this case, it's exactly
+  what we just said we wanted.
+* In the context of adapters at interface boundaries copying from source to 
+  destination, there should be no problem. The compiler can ensure this.
+  Not something programmer writes by hand.
+
+* But doesn't lazy evaluation add overhead? Not with the static use-def
+  property. Compiler can *statically* determine where a lifting instruction
+  is consumed and thus compile *all* lifting and lowering instructions into
+  fused direct-copy operations.
+
+* For example, this byte array lifting+lowering
+  * Example
+* would be fused by the compiler into, effectively, this core wasm code:
+  * Example
+
+
+### Ownership Instructions: Reliably Releasing Resources in the Presence of Laziness
+
+TODO
+* Laziness avoids copies, but adds complexity in side-effectful world
+  (which is why laziness is usually coupled with purity).
+* Mostly it's not a problem for interface types b/c they're only used
+  at module boundaries and can be generated by a compiler that is
+  careful.
+* There is one persistent issue though: ownership.
+* In particular: how does m
+
+* What to do when function returns interface value?
+* How to pass value that is freed right after being read?
+* With laziness: don't have a good place to put the 'free`
+* It depends on the lifetime of the lazy value
+* So add first-class instruction and type to `adaptertype`: `(own T)`
+
+
+### Exception and Trap Safety
+
+TODO
+* Default: exceptions turn to traps at boundary
+* Why necessary default
+* Puts the burden on exception-safe languages to make explicit as variant return type
+* In theory, could add exception-specification to interface types, but it is
+  morally equivalent, especially once we recognize the `result` abbreviation
+
+TODO
+* Early wasm discussions: can you observe memory after trap? Call into an instance?
+* Yes, we had to because...
+* But this is terrible for the ecosystem
+* With IT, have shared-nothing boundary, can enforce b/c IT takes the role of host
+* So we specify this for components.
+
+
+## Use Cases Revisited
+
+TODO
+
+### Optimizing calls to Web APIs (revisited)
+
+TODO:
+* Define mapping from Web IDL to interface types
+* Valuable for incorporating Web IDL specs into WASI
+
+The way this is to be achieved is by extending the Web IDL specification to
+include a "WebAssembly binding" section which describes how WebAssembly types
+(including the new interface types added by this proposal) are converted to and
+from Web IDL types.
 
 Since both Web IDL and WebAssembly are statically-typed, this specification
 would start by defining when two Web IDL and WebAssembly types **match**. When
@@ -657,7 +797,7 @@ two types match, the specification would define how values of the two types are
 converted back and forth.
 
 In particular, going down the list of [Web IDL types]:
-* [`any`]: the existing WebAssembly [`anyref`] type is already effectively
+* [`any`]: the existing WebAssembly [`externref`] type is already effectively
   the same as `any` in Web embeddings.
 * [Primitive types]: WebAssembly value types already can be efficiently
   converted back and forth.
@@ -672,13 +812,13 @@ In particular, going down the list of [Web IDL types]:
 * [`ByteString`]: as a raw sequence of uninterpreted bytes, this type is probably
   best converted to and from a WebAssembly sequence interface type.
 * [`object`], [`symbol`], [Frozen array] types: as JS-specific types, these
-  could either be converted to and from `anyref` or be statically typed via
+  could either be converted to and from `externref` or be statically typed via
   reference to a [type import].
 * [Interface] types: while Web IDL defines interfaces as namespace structures
   containing methods, fields, etc., for the specific purpose of typing Web API
   functions, a Web IDL Interface type just defines an abstract reference type
   used in Web API function signatures. WebAssembly can represent this type with
-  either an `anyref` (implying dynamic type checks) or via reference to 
+  either an `externref` (implying dynamic type checks) or via reference to 
   [type import].
 * [Callback], [Dictionary], [Sequence] types: these would be converted to and
   from WebAssembly closure, record, and sequence interface types, respectively.
@@ -714,77 +854,96 @@ ECMAScript binding. To help well-intentioned developers avoid unintended
 performance degradation, WebAssembly engines could emit warning diagnostics on
 mismatch.
 
+TODO: describe the JS API
+
+
+### Defining language-neutral interfaces like WASI (revisited)
+
+TODO:
+* talk about source-language generation from .wit files
+* still want some mechanism to include common typedefs: hence .witx
+
+
+### Enabling "shared-nothing linking" of WebAssembly modules (revisited)
+
+TODO
+* example: how to generate source-language client definitions from .wasm
+
+
+### Scoping Shared-Everything Linking (revisited)
+
+TODO
+* reify diagram with code
+
+
+## Additional Requirements Revisited
+
+TODO
+
 
 ## FAQ
 
-### Will the set of adapter instructions grow to duplicate all of WebAssembly?
+TODO:
+* How does this relate to ESM-integration?
+  * As with JS API: the outside world only sees the component
+  * Component (instance) imports work symmetric to Module (instance) imports in Module Linking
+  * With Interface Types, ESM-integration can yield glue-code-less wasm modules
+  * The only thing left to achieve parity with JS is the ability for wasm modules to import Web APIs,
+    which we could get "for free" in the future from the revised [get-originals] proposal
 
-No; the criteria for adding an adapter instruction is that the instruction must
-solve a problem that couldn't otherwise be solved (without significant
-overhead) in core WebAssembly. For example, adapter instructions don't need to
-include the myriad of numeric conversion operators. Similarly, the proposal can
-leverage existing and planned reference types ([`anyref`], [function references],
-[type imports], [GC]) to, e.g., define [abstract data types].
 
-### Why not just add adapter instructions to the core WebAssembly instruction set?
+## TODO
 
-The anticipated optimization strategy described [above](#lifting-lowering-and-laziness)
-relies on (1) declarative restrictions on adapter function code and (2) waiting
-to compile adapter functions until [instantiation]-time, when both sides of an
-import are known to the engine. In contrast, core WebAssembly code is not
-declarative and is often compiled/cached before instantiation-time. This
-conflict would result in unpredictable and irregular performance and force
-engines to make unnecessary heuristic tradeoffs. Additionaly, the semantic
-layering helps keep core wasm simple.
+* slices
+* an `any` type
+* lifting and lowering between `intertype`s and core wasm abstract reference types
+* a mechanism for specifying the receiver of a method call ([#87](https://github.com/WebAssembly/interface-types/issues/87))
+* types for describing resources and the passing of handles to resources between components
+* closures and a mechanism for managing the lifetime of closure state
 
 
 
-[core spec]: https://webassembly.github.io/spec/core
-[Module Syntax]: https://webassembly.github.io/spec/core/syntax/modules.html#syntax-module
-[Old Module Type]: https://webassembly.github.io/spec/core/valid/modules.html#valid-module
-[New Module Type]: https://github.com/WebAssembly/module-types/blob/master/proposals/module-types/Overview.md
-[Instructions]: https://webassembly.github.io/spec/core/syntax/instructions.html
-[Control Instructions]: https://webassembly.github.io/spec/core/syntax/instructions.html#syntax-instr-control
-[Instantiation]: https://webassembly.github.io/spec/core/exec/modules.html#exec-instantiation
-[Known Section]: https://webassembly.github.io/spec/core/binary/modules.html#sections
-[Custom Section]: https://webassembly.github.io/spec/core/binary/modules.html#custom-section
-[Value Types]: https://webassembly.github.io/spec/core/syntax/types.html#value-types
-[Folded S-expressions]: https://webassembly.github.io/spec/core/text/instructions.html#folded-instructions
 
-[Dynamic Linking]: https://webassembly.github.io/website/docs/dynamic-linking
-
-[`memory.copy`]: https://github.com/WebAssembly/bulk-memory-operations/blob/master/proposals/bulk-memory-operations/Overview.md#memorycopy-instruction
+[Core Spec]: https://webassembly.github.io/spec/core
+[JS API]: https://webassembly.github.io/spec/js-api/index.html
+[Web API]: https://webassembly.github.io/spec/web-api/index.html
+[C API]: https://github.com/WebAssembly/wasm-c-api
+[Abbreviations]: https://webassembly.github.io/reference-types/core/text/conventions.html#abbreviations
+[`name`]: https://webassembly.github.io/spec/core/text/values.html#names
+[`valtype`]: https://webassembly.github.io/spec/core/syntax/types.html#syntax-valtype
+[`instr`]: https://webassembly.github.io/spec/core/syntax/instructions.html#syntax-instr
+[Control Instructions]: https://webassembly.github.io/spec/core/syntax/instructions.html#control-instructions
 
 [Reference Types]: https://github.com/WebAssembly/reference-types/blob/master/proposals/reference-types/Overview.md
-[`anyref`]: https://webassembly.github.io/reference-types/core/syntax/types.html#syntax-reftype
+[`externref`]: https://webassembly.github.io/reference-types/core/syntax/types.html#syntax-reftype
+
 [Function References]: https://github.com/WebAssembly/function-references/blob/master/proposals/function-references/Overview.md
-[Type Imports]: https://github.com/WebAssembly/proposal-type-imports/blob/master/proposals/type-imports/Overview.md#imports
+
+[Exception Handling]: https://github.com/webassembly/exception-handling
+
 [Type Import]: https://github.com/WebAssembly/proposal-type-imports/blob/master/proposals/type-imports/Overview.md#imports
+
+[Module Linking]: https://github.com/WebAssembly/module-linking/blob/master/proposals/module-linking/Explainer.md
+[shared-everything-use-case]: https://github.com/WebAssembly/module-linking/blob/master/proposals/module-linking/Explainer.md#shared-everything-dynamic-linking
+[shared-everything-example]: https://github.com/WebAssembly/module-linking/blob/master/proposals/module-linking/Example-SharedEverythingDynamicLinking.md
+
 [GC]: https://github.com/WebAssembly/gc/blob/master/proposals/gc/Overview.md
 
-[Multi-value]: https://github.com/WebAssembly/multi-value/blob/master/proposals/multi-value/Overview.md
-[Block Validation]: https://webassembly.github.io/multi-value/core/valid/instructions.html#valid-block
-[Select Validation]: https://webassembly.github.io/reference-types/core/valid/instructions.html#valid-select
+[WASI]: https://github.com/webassembly/wasi
+[`path_open`]: https://github.com/WebAssembly/WASI/blob/master/design/WASI-core.md#path_open
 
-[Multi-memory]: https://github.com/WebAssembly/multi-memory
+[Native Dynamic Linking]: https://en.wikipedia.org/wiki/Dynamic_linker
+[Product Type]: https://en.wikipedia.org/wiki/Product_type
+[Sum Type]: https://en.wikipedia.org/wiki/Sum_type
+[Eager Evaluation]: https://en.wikipedia.org/wiki/Eager_evaluation
+[Lazy Evaluation]: https://en.wikipedia.org/wiki/Lazy_evaluation
+[SSA Form]: https://en.wikipedia.org/wiki/Static_single_assignment_form
 
-[Exception Handling]: https://github.com/WebAssembly/exception-handling/blob/master/proposals/Exceptions.md
-
-[Custom Annotation]: https://github.com/WebAssembly/annotations/blob/master/proposals/annotations/Overview.md
-
-[JS API]: https://webassembly.github.io/spec/js-api/index.html
-
-[`Reflect.construct`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect/construct
-[`Reflect.apply`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect/apply
-[`Reflect.set`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect/set
-[`Reflect.get`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect/get
-
-[Web IDL]: https://heycam.github.io/webidl
-[Web IDL types]: https://heycam.github.io/webidl/#idl-types
-[Primitive types]: https://heycam.github.io/webidl/#dfn-primitive-type
 [ECMAScript Binding]: https://heycam.github.io/webidl/#ecmascript-binding
-[Callback]: https://heycam.github.io/webidl/#idl-callback-function
+[Web IDL Types]: https://heycam.github.io/webidl/#idl-types
+[Primitive Types]: https://heycam.github.io/webidl/#dfn-primitive-type
 [Dictionary]: https://heycam.github.io/webidl/#idl-dictionaries
+[Callback]: https://heycam.github.io/webidl/#idl-callback-function
 [Sequence]: https://heycam.github.io/webidl/#idl-sequence
 [Record]: https://heycam.github.io/webidl/#idl-record
 [Enumeration]: https://heycam.github.io/webidl/#idl-enumeration
@@ -803,24 +962,6 @@ layering helps keep core wasm simple.
 [`USVString`]: https://heycam.github.io/webidl/#idl-USVString
 [`DOMString`-to-`USVString` conversion]: https://heycam.github.io/webidl/#dfn-obtain-unicode
 
-[Unicode Code Points]: https://unicode.org/glossary/#code_point
 [Unicode Scalar Values]: https://unicode.org/glossary/#unicode_scalar_value
-[Unicode Encoding Scheme]: https://unicode.org/glossary/#encoding_scheme
-[Code Units]: https://unicode.org/glossary/#code_unit
-[Surrogate Code Points]: https://unicode.org/glossary/#surrogate_code_point
-[Replacement Character]: https://unicode.org/glossary/#replacement_character
-[WHATWG Encoding]: https://encoding.spec.whatwg.org
-[WTF-8]: https://simonsapin.github.io/wtf-8/
-
-[WASI]: https://github.com/webassembly/wasi
-[`path_open`]: https://github.com/WebAssembly/WASI/blob/master/design/WASI-core.md#path_open
-
-[Embind]: https://emscripten.org/docs/porting/connecting_cpp_and_javascript/embind.html
-[wasm-bindgen]: https://github.com/rustwasm/wasm-bindgen
-
-[native dynamic linking]: https://en.wikipedia.org/wiki/Dynamic_linker
-[abstract data types]: https://en.wikipedia.org/wiki/Abstract_data_type
-[eager evaluation]: https://en.wikipedia.org/wiki/Eager_evaluation
-[lazily]: https://en.wikipedia.org/wiki/Lazy_evaluation
-[thunks]: https://wiki.haskell.org/Thunk
-[partially evaluated]: https://en.wikipedia.org/wiki/Partial_evaluation
+[Encoding API]: https://encoding.spec.whatwg.org
+[Error Mode]: https://encoding.spec.whatwg.org/#error-mode
